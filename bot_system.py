@@ -68,12 +68,36 @@ def _load_local_secrets():
     if not path.exists():
         return {}
     try:
-        with open(path, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        raw = path.read_bytes()
     except Exception as e:
-        print(f"⚠️ Не удалось прочитать {path}: {e}")
+        print(f"⚠️ Не удалось открыть {path}: {e}")
         return {}
+    if not raw.strip():
+        print(f"⚠️ {path} пустой. Впишите в него JSON и сохраните (Ctrl+S).")
+        return {}
+    text = None
+    last_err = None
+    for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'cp1251'):
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if text is None:
+        print(f"⚠️ {path}: не удалось распознать кодировку: {last_err}")
+        return {}
+    text = text.lstrip('﻿').strip()
+    if not text:
+        print(f"⚠️ {path} пустой после разбора. Сохраните файл с валидным JSON.")
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        head = repr(raw[:60])
+        print(f"⚠️ {path}: невалидный JSON ({e}). Первые байты: {head}")
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 _load_dotenv()
