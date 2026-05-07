@@ -296,6 +296,53 @@ def install_premium_emoji_filter(application):
     bot_cls._premium_emoji_patched = True
 
 
+def install_premium_button_filter():
+    """Автоматически выставляет icon_custom_emoji_id у InlineKeyboardButton
+    на основе ведущего эмодзи в text.
+
+    Требует python-telegram-bot >= 22.7 и Telegram Premium
+    у владельца бота (либо Fragment-username у самого бота).
+    """
+    try:
+        from telegram import InlineKeyboardButton
+    except ImportError:
+        return False
+
+    if getattr(InlineKeyboardButton, '_premium_icon_patched', False):
+        return True
+
+    # Пробуем передать icon_custom_emoji_id — если версия PTB старая, падёт
+    try:
+        InlineKeyboardButton(
+            text="x", callback_data="x", icon_custom_emoji_id="0"
+        )
+        supported = True
+    except TypeError:
+        supported = False
+
+    if not supported:
+        print("⚠️  Текущая версия python-telegram-bot не поддерживает")
+        print("   icon_custom_emoji_id у InlineKeyboardButton.")
+        print("   Обновите: pip install -U python-telegram-bot")
+        return False
+
+    original_init = InlineKeyboardButton.__init__
+
+    def patched_init(self, text, *args, **kwargs):
+        if 'icon_custom_emoji_id' not in kwargs and text:
+            for emoji in _PREMIUM_EMOJI_SORTED:
+                if text.startswith(emoji):
+                    kwargs['icon_custom_emoji_id'] = PREMIUM_EMOJI_MAP[emoji]
+                    rest = text[len(emoji):].lstrip()
+                    text = rest if rest else text
+                    break
+        original_init(self, text, *args, **kwargs)
+
+    InlineKeyboardButton.__init__ = patched_init
+    InlineKeyboardButton._premium_icon_patched = True
+    return True
+
+
 # ==================== PER-USER ХРАНИЛИЩЕ ====================
 
 def user_data_dir(user_id):
@@ -2232,6 +2279,10 @@ def main():
     # Перехватываем bot.send_message / bot.edit_message_text:
     # автоматически заменяем эмодзи на premium custom emoji (HTML-теги).
     install_premium_emoji_filter(application)
+
+    # Иконки premium-эмодзи у inline-кнопок (icon_custom_emoji_id).
+    # Требует PTB >= 22.7 и Telegram Premium у владельца бота.
+    install_premium_button_filter()
 
     application.add_error_handler(error_handler)
 
