@@ -254,38 +254,46 @@ def with_premium(text):
 def install_premium_emoji_filter(application):
     """Авто-замена обычных эмодзи на premium в сообщениях бота.
 
-    Перехватывает bot.send_message и bot.edit_message_text — оборачивает
-    text через with_premium() и принудительно ставит parse_mode='HTML'.
+    Патчит класс bot'а (PTB v20+ запрещает менять атрибуты экземпляра).
+    Оборачивает send_message / edit_message_text / send_animation /
+    send_photo / send_document / answer_callback_query и др. — прогоняет
+    text/caption через with_premium() и принудительно ставит parse_mode='HTML'.
     """
-    bot = application.bot
+    bot_cls = type(application.bot)
+    if getattr(bot_cls, '_premium_emoji_patched', False):
+        return
 
-    original_send_message = bot.send_message
-    original_edit_message_text = bot.edit_message_text
+    def _wrap_text(method, text_param, text_pos):
+        original = getattr(bot_cls, method, None)
+        if original is None:
+            return
 
-    async def send_message_patched(*args, **kwargs):
-        if 'text' in kwargs and kwargs['text']:
-            kwargs['text'] = with_premium(kwargs['text'])
-            kwargs.setdefault('parse_mode', 'HTML')
-        elif len(args) >= 2 and args[1]:
-            args = list(args)
-            args[1] = with_premium(args[1])
-            kwargs.setdefault('parse_mode', 'HTML')
-            args = tuple(args)
-        return await original_send_message(*args, **kwargs)
+        async def wrapper(self, *args, **kwargs):
+            if text_param in kwargs and kwargs[text_param]:
+                kwargs[text_param] = with_premium(kwargs[text_param])
+                kwargs.setdefault('parse_mode', 'HTML')
+            elif len(args) > text_pos and args[text_pos]:
+                args = list(args)
+                args[text_pos] = with_premium(args[text_pos])
+                kwargs.setdefault('parse_mode', 'HTML')
+                args = tuple(args)
+            return await original(self, *args, **kwargs)
 
-    async def edit_message_text_patched(*args, **kwargs):
-        if 'text' in kwargs and kwargs['text']:
-            kwargs['text'] = with_premium(kwargs['text'])
-            kwargs.setdefault('parse_mode', 'HTML')
-        elif args and args[0]:
-            args = list(args)
-            args[0] = with_premium(args[0])
-            kwargs.setdefault('parse_mode', 'HTML')
-            args = tuple(args)
-        return await original_edit_message_text(*args, **kwargs)
+        wrapper.__name__ = method
+        setattr(bot_cls, method, wrapper)
 
-    bot.send_message = send_message_patched
-    bot.edit_message_text = edit_message_text_patched
+    # Основные методы с текстом
+    _wrap_text('send_message', 'text', 1)        # send_message(chat_id, text, ...)
+    _wrap_text('edit_message_text', 'text', 0)   # edit_message_text(text, chat_id=...)
+    _wrap_text('answer_callback_query', 'text', 1)
+
+    # Методы с caption
+    for m in ('send_photo', 'send_video', 'send_animation',
+              'send_document', 'send_audio', 'send_voice',
+              'send_media_group', 'edit_message_caption'):
+        _wrap_text(m, 'caption', 99)  # caption всегда идёт kwargs'ом
+
+    bot_cls._premium_emoji_patched = True
 
 
 # ==================== PER-USER ХРАНИЛИЩЕ ====================
