@@ -28,9 +28,41 @@ from telegram.ext import (
 # ==================== НАСТРОЙКИ ====================
 # Конфигурация читается из (по приоритету):
 #   1) переменных окружения ADMIN_BOT_TOKEN / MAIN_ADMIN_ID;
-#   2) локального файла secrets.json рядом со скриптом
+#   2) .env рядом со скриптом (формат KEY=VALUE по строкам);
+#   3) secrets.json рядом со скриптом
 #      (формат: {"ADMIN_BOT_TOKEN": "...", "MAIN_ADMIN_ID": 123456}).
-# secrets.json должен быть в .gitignore — не коммитьте токен.
+# .env / secrets.json должны быть в .gitignore — не коммитьте токен.
+def _load_dotenv():
+    """Простой парсер .env (без внешних зависимостей).
+    Читает файл .env рядом со скриптом и вкладывает пары
+    KEY=VALUE в os.environ (не перезаписывая уже заданные переменные).
+    """
+    path = Path(__file__).resolve().parent / '.env'
+    if not path.exists():
+        return
+    try:
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#'):
+                    continue
+                # Поддерживаем синтаксис "export KEY=VALUE"
+                if line.startswith('export '):
+                    line = line[len('export '):].lstrip()
+                if '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip()
+                # Снимаем обрамляющие кавычки
+                if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+                    v = v[1:-1]
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать {path}: {e}")
+
+
 def _load_local_secrets():
     path = Path(__file__).resolve().parent / 'secrets.json'
     if not path.exists():
@@ -44,6 +76,7 @@ def _load_local_secrets():
         return {}
 
 
+_load_dotenv()
 _LOCAL_SECRETS = _load_local_secrets()
 ADMIN_BOT_TOKEN = (
     os.getenv("ADMIN_BOT_TOKEN")
