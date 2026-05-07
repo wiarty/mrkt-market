@@ -374,14 +374,24 @@ def migrate_legacy_data():
 # ==================== ФУНКЦИИ ПОЛЬЗОВАТЕЛЕЙ ====================
 
 def load_users():
-    """Загружает список разрешенных пользователей"""
+    """Загружает список разрешенных пользователей."""
     global allowed_users
     if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            allowed_users = data.get('users', [MAIN_ADMIN_ID])
+        try:
+            with open(USERS_FILE, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+            allowed_users = list(data.get('users') or [])
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать {USERS_FILE}: {e}. Сбрасываю список.")
+            allowed_users = []
     else:
-        allowed_users = [MAIN_ADMIN_ID]
+        allowed_users = []
+
+    # Главный админ всегда в списке.
+    if MAIN_ADMIN_ID and MAIN_ADMIN_ID not in allowed_users:
+        allowed_users.append(MAIN_ADMIN_ID)
+        save_users()
+    elif not os.path.exists(USERS_FILE):
         save_users()
     return allowed_users
 
