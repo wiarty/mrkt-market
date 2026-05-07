@@ -1042,10 +1042,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_allowed(user_id):
         await update.message.reply_text(
-            "❌ <b>Доступ запрещен</b>\n\n"
-            "У вас нет доступа к этому боту.",
+            f"❌ <b>Доступ запрещен</b>\n\n"
+            f"У вас нет доступа к этому боту.\n\n"
+            f"Ваш ID: <code>{user_id}</code>\n"
+            f"MAIN_ADMIN_ID: <code>{MAIN_ADMIN_ID}</code>\n\n"
+            f"Если это ваш бот — поправьте MAIN_ADMIN_ID в secrets.json/.env, "
+            f"или добавьте свой ID в users.json.",
             parse_mode='HTML'
         )
+        print(f"[start] Отказ в доступе: user_id={user_id}, MAIN_ADMIN_ID={MAIN_ADMIN_ID}, allowed={allowed_users}")
         return
     
     role = "Главный админ" if user_id == MAIN_ADMIN_ID else "Пользователь"
