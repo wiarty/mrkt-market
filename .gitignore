@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local secrets — НЕ КОММИТИТЬ
+secrets.json
+.env
+.env.*
+
+# Telethon sessions
+*.session
+*.session-journal
+
+# Per-user data
+data/
+
+# Legacy data (мигрируется при первом старте)
+accounts.json
+scenarios.json
+config.json
+users.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store

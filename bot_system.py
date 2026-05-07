@@ -26,8 +26,38 @@ from telegram.ext import (
 )
 
 # ==================== НАСТРОЙКИ ====================
-ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")
-MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "0"))  # Главный админ
+# Конфигурация читается из (по приоритету):
+#   1) переменных окружения ADMIN_BOT_TOKEN / MAIN_ADMIN_ID;
+#   2) локального файла secrets.json рядом со скриптом
+#      (формат: {"ADMIN_BOT_TOKEN": "...", "MAIN_ADMIN_ID": 123456}).
+# secrets.json должен быть в .gitignore — не коммитьте токен.
+def _load_local_secrets():
+    path = Path(__file__).resolve().parent / 'secrets.json'
+    if not path.exists():
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать {path}: {e}")
+        return {}
+
+
+_LOCAL_SECRETS = _load_local_secrets()
+ADMIN_BOT_TOKEN = (
+    os.getenv("ADMIN_BOT_TOKEN")
+    or _LOCAL_SECRETS.get("ADMIN_BOT_TOKEN")
+    or ""
+)
+try:
+    MAIN_ADMIN_ID = int(
+        os.getenv("MAIN_ADMIN_ID")
+        or _LOCAL_SECRETS.get("MAIN_ADMIN_ID")
+        or 0
+    )
+except (TypeError, ValueError):
+    MAIN_ADMIN_ID = 0
 
 # ==================== ФАЙЛЫ ====================
 USERS_FILE = 'users.json'
@@ -2077,6 +2107,15 @@ def main():
     global admin_bot_app
 
     print("🚀 Запуск панели управления...")
+
+    if not ADMIN_BOT_TOKEN or MAIN_ADMIN_ID == 0:
+        script_dir = Path(__file__).resolve().parent
+        print("❌ Не задан ADMIN_BOT_TOKEN и/или MAIN_ADMIN_ID.")
+        print("   Создайте файл secrets.json рядом со скриптом:")
+        print(f"   {script_dir / 'secrets.json'}")
+        print('   {"ADMIN_BOT_TOKEN": "<токен_от_BotFather>", "MAIN_ADMIN_ID": 123456789}')
+        print("   Либо задайте переменные окружения ADMIN_BOT_TOKEN и MAIN_ADMIN_ID.")
+        return
 
     # Загружаем пользователей
     load_users()
