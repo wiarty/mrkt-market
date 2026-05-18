@@ -2,6 +2,8 @@ import asyncio
 import random
 import json
 import os
+import shutil
+from pathlib import Path
 import telegram
 from datetime import datetime
 from telegram.error import TimedOut, NetworkError
@@ -24,14 +26,110 @@ from telegram.ext import (
 )
 
 # ==================== НАСТРОЙКИ ====================
-ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")
-MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "0"))  # Главный админ
+# Конфигурация читается из (по приоритету):
+#   1) переменных окружения ADMIN_BOT_TOKEN / MAIN_ADMIN_ID;
+#   2) .env рядом со скриптом (формат KEY=VALUE по строкам);
+#   3) secrets.json рядом со скриптом
+#      (формат: {"ADMIN_BOT_TOKEN": "...", "MAIN_ADMIN_ID": 123456}).
+# .env / secrets.json должны быть в .gitignore — не коммитьте токен.
+def _load_dotenv():
+    """Простой парсер .env (без внешних зависимостей).
+    Читает файл .env рядом со скриптом и вкладывает пары
+    KEY=VALUE в os.environ (не перезаписывая уже заданные переменные).
+    """
+    path = Path(__file__).resolve().parent / '.env'
+    if not path.exists():
+        return
+    try:
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#'):
+                    continue
+                # Поддерживаем синтаксис "export KEY=VALUE"
+                if line.startswith('export '):
+                    line = line[len('export '):].lstrip()
+                if '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip()
+                # Снимаем обрамляющие кавычки
+                if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+                    v = v[1:-1]
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать {path}: {e}")
+
+
+def _load_local_secrets():
+    path = Path(__file__).resolve().parent / 'secrets.json'
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_bytes()
+    except Exception as e:
+        print(f"⚠️ Не удалось открыть {path}: {e}")
+        return {}
+    if not raw.strip():
+        print(f"⚠️ {path} пустой. Впишите в него JSON и сохраните (Ctrl+S).")
+        return {}
+    text = None
+    last_err = None
+    for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'cp1251'):
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if text is None:
+        print(f"⚠️ {path}: не удалось распознать кодировку: {last_err}")
+        return {}
+    text = text.lstrip('﻿').strip()
+    if not text:
+        print(f"⚠️ {path} пустой после разбора. Сохраните файл с валидным JSON.")
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        head = repr(raw[:60])
+        print(f"⚠️ {path}: невалидный JSON ({e}). Первые байты: {head}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+_load_dotenv()
+_LOCAL_SECRETS = _load_local_secrets()
+ADMIN_BOT_TOKEN = (
+    os.getenv("ADMIN_BOT_TOKEN")
+    or _LOCAL_SECRETS.get("ADMIN_BOT_TOKEN")
+    or ""
+)
+try:
+    MAIN_ADMIN_ID = int(
+        os.getenv("MAIN_ADMIN_ID")
+        or _LOCAL_SECRETS.get("MAIN_ADMIN_ID")
+        or 0
+    )
+except (TypeError, ValueError):
+    MAIN_ADMIN_ID = 0
 
 # ==================== ФАЙЛЫ ====================
-ACCOUNTS_FILE = 'accounts.json'
-SCENARIOS_FILE = 'scenarios.json'
-CONFIG_FILE = 'config.json'
 USERS_FILE = 'users.json'
+DATA_DIR = Path('data')
+
+# Имена файлов внутри директории каждого пользователя
+ACCOUNTS_FILENAME = 'accounts.json'
+SCENARIOS_FILENAME = 'scenarios.json'
+CONFIG_FILENAME = 'config.json'
+SESSIONS_DIRNAME = 'sessions'
+
+# Старые пути (для одноразовой миграции)
+LEGACY_ACCOUNTS_FILE = 'accounts.json'
+LEGACY_SCENARIOS_FILE = 'scenarios.json'
+LEGACY_CONFIG_FILE = 'config.json'
 
 # ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 active_sessions = {}
@@ -43,17 +141,304 @@ reply_cache = {}
 allowed_users = []
 GREETINGS = ["привет", "приветик", "приветствую", "ку", "здарова"]
 
+# ==================== PREMIUM EMOJI ====================
+# Маппинг обычных эмодзи -> premium custom emoji ID.
+# Применяется автоматически ко всем сообщениям бота через
+# install_premium_emoji_filter() (см. main()).
+PREMIUM_EMOJI_MAP = {
+    '⚙️': '5870982283724328568',
+    '⚙': '5870982283724328568',
+    '👤': '5870994129244131212',
+    '👥': '5870772616305839506',
+    '📁': '5870528606328852614',
+    '🙂': '5870764288364252592',
+    '📊': '5870921681735781843',
+    '📈': '5870930636742595124',
+    '🏘': '5873147866364514353',
+    '🏘️': '5873147866364514353',
+    '🔒': '6037249452824072506',
+    '🔐': '6037249452824072506',
+    '🔓': '6037496202990194718',
+    '📣': '6039422865189638057',
+    '📢': '6039422865189638057',
+    '✅': '5870633910337015697',
+    '❌': '5870657884844462243',
+    '🖋': '5870676941614354370',
+    '🖋️': '5870676941614354370',
+    '🗑': '5870875489362513438',
+    '🗑️': '5870875489362513438',
+    '📰': '5893057118545646106',
+    '📎': '6039451237743595514',
+    '🔗': '5769289093221454192',
+    'ℹ': '6028435952299413210',
+    'ℹ️': '6028435952299413210',
+    '🤖': '6030400221232501136',
+    '👁': '6037397706505195857',
+    '👁️': '6037397706505195857',
+    '⬆': '5963103826075456248',
+    '⬆️': '5963103826075456248',
+    '⬇': '6039802767931871481',
+    '⬇️': '6039802767931871481',
+    '🔔': '6039486778597970865',
+    '🎁': '6032644646587338669',
+    '⏰': '5983150113483134607',
+    '⏱': '5983150113483134607',
+    '⏱️': '5983150113483134607',
+    '🎉': '6041731551845159060',
+    '✍': '5870753782874246579',
+    '✍️': '5870753782874246579',
+    '🖼': '6035128606563241721',
+    '🖼️': '6035128606563241721',
+    '📍': '6042011682497106307',
+    '👛': '5769126056262898415',
+    '📦': '5884479287171485878',
+    '👾': '5260752406890711732',
+    '📅': '5890937706803894250',
+    '🏷': '5886285355279193209',
+    '🏷️': '5886285355279193209',
+    '🕓': '5775896410780079073',
+    '🖌': '6050679691004612757',
+    '🖌️': '6050679691004612757',
+    '🔡': '5771851822897566479',
+    '↔': '5778479949572738874',
+    '↔️': '5778479949572738874',
+    '🪙': '5904462880941545555',
+    '🏧': '5879814368572478751',
+    '🔨': '5940433880585605708',
+    '🔄': '5345906554510012647',
+    # Дополнительные психологически близкие эмодзи к набору
+    '🟢': '5870633910337015697',
+    '🔴': '5870657884844462243',
+    '🚀': '5963103826075456248',
+    '⏳': '5983150113483134607',
+}
+
+# Эмодзи, отсортированные по длине (для корректной обработки vs селекторов VS16)
+_PREMIUM_EMOJI_SORTED = sorted(PREMIUM_EMOJI_MAP.keys(), key=len, reverse=True)
+
+
+def with_premium(text):
+    """Заменяет известные эмодзи в строке на premium custom emoji HTML-теги.
+
+    Для отображения требуется parse_mode='HTML'. Если эмодзи не из набора —
+    остаётся без изменений.
+    """
+    if not text:
+        return text
+    result = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Не обрабатываем содержимое уже существующих <tg-emoji ...>...</tg-emoji>
+        if text.startswith('<tg-emoji ', i):
+            end = text.find('</tg-emoji>', i)
+            if end != -1:
+                end += len('</tg-emoji>')
+                result.append(text[i:end])
+                i = end
+                continue
+        matched = False
+        for emoji in _PREMIUM_EMOJI_SORTED:
+            if text.startswith(emoji, i):
+                eid = PREMIUM_EMOJI_MAP[emoji]
+                result.append(f'<tg-emoji emoji-id="{eid}">{emoji}</tg-emoji>')
+                i += len(emoji)
+                matched = True
+                break
+        if not matched:
+            result.append(text[i])
+            i += 1
+    return ''.join(result)
+
+
+def install_premium_emoji_filter(application):
+    """Авто-замена обычных эмодзи на premium в сообщениях бота.
+
+    Патчит класс bot'а (PTB v20+ запрещает менять атрибуты экземпляра).
+    Оборачивает send_message / edit_message_text / send_animation /
+    send_photo / send_document / answer_callback_query и др. — прогоняет
+    text/caption через with_premium() и принудительно ставит parse_mode='HTML'.
+    """
+    bot_cls = type(application.bot)
+    if getattr(bot_cls, '_premium_emoji_patched', False):
+        return
+
+    def _wrap_text(method, text_param, text_pos):
+        original = getattr(bot_cls, method, None)
+        if original is None:
+            return
+
+        async def wrapper(self, *args, **kwargs):
+            if text_param in kwargs and kwargs[text_param]:
+                kwargs[text_param] = with_premium(kwargs[text_param])
+                kwargs.setdefault('parse_mode', 'HTML')
+            elif len(args) > text_pos and args[text_pos]:
+                args = list(args)
+                args[text_pos] = with_premium(args[text_pos])
+                kwargs.setdefault('parse_mode', 'HTML')
+                args = tuple(args)
+            return await original(self, *args, **kwargs)
+
+        wrapper.__name__ = method
+        setattr(bot_cls, method, wrapper)
+
+    # Основные методы с текстом
+    _wrap_text('send_message', 'text', 1)        # send_message(chat_id, text, ...)
+    _wrap_text('edit_message_text', 'text', 0)   # edit_message_text(text, chat_id=...)
+    _wrap_text('answer_callback_query', 'text', 1)
+
+    # Методы с caption
+    for m in ('send_photo', 'send_video', 'send_animation',
+              'send_document', 'send_audio', 'send_voice',
+              'send_media_group', 'edit_message_caption'):
+        _wrap_text(m, 'caption', 99)  # caption всегда идёт kwargs'ом
+
+    bot_cls._premium_emoji_patched = True
+
+
+def install_premium_button_filter():
+    """Автоматически выставляет icon_custom_emoji_id у InlineKeyboardButton
+    на основе ведущего эмодзи в text.
+
+    Требует python-telegram-bot >= 22.7 и Telegram Premium
+    у владельца бота (либо Fragment-username у самого бота).
+    """
+    try:
+        from telegram import InlineKeyboardButton
+    except ImportError:
+        return False
+
+    if getattr(InlineKeyboardButton, '_premium_icon_patched', False):
+        return True
+
+    # Пробуем передать icon_custom_emoji_id — если версия PTB старая, падёт
+    try:
+        InlineKeyboardButton(
+            text="x", callback_data="x", icon_custom_emoji_id="0"
+        )
+        supported = True
+    except TypeError:
+        supported = False
+
+    if not supported:
+        print("⚠️  Текущая версия python-telegram-bot не поддерживает")
+        print("   icon_custom_emoji_id у InlineKeyboardButton.")
+        print("   Обновите: pip install -U python-telegram-bot")
+        return False
+
+    original_init = InlineKeyboardButton.__init__
+
+    def patched_init(self, text, *args, **kwargs):
+        if 'icon_custom_emoji_id' not in kwargs and text:
+            for emoji in _PREMIUM_EMOJI_SORTED:
+                if text.startswith(emoji):
+                    kwargs['icon_custom_emoji_id'] = PREMIUM_EMOJI_MAP[emoji]
+                    rest = text[len(emoji):].lstrip()
+                    text = rest if rest else text
+                    break
+        original_init(self, text, *args, **kwargs)
+
+    InlineKeyboardButton.__init__ = patched_init
+    InlineKeyboardButton._premium_icon_patched = True
+    return True
+
+
+# ==================== PER-USER ХРАНИЛИЩЕ ====================
+
+def user_data_dir(user_id):
+    """Возвращает директорию данных пользователя (создаёт при необходимости)."""
+    p = DATA_DIR / str(user_id)
+    p.mkdir(parents=True, exist_ok=True)
+    (p / SESSIONS_DIRNAME).mkdir(exist_ok=True)
+    return p
+
+
+def user_accounts_path(user_id):
+    return user_data_dir(user_id) / ACCOUNTS_FILENAME
+
+
+def user_scenarios_path(user_id):
+    return user_data_dir(user_id) / SCENARIOS_FILENAME
+
+
+def user_config_path(user_id):
+    return user_data_dir(user_id) / CONFIG_FILENAME
+
+
+def user_session_path(user_id, session_name):
+    """Полный путь к файлу telethon-сессии для пользователя."""
+    return str(user_data_dir(user_id) / SESSIONS_DIRNAME / session_name)
+
+
+def make_session_name(user_id, phone):
+    """Генерирует уникальное имя сессии (включая user_id для изоляции)."""
+    safe_phone = phone.replace('+', '').replace(' ', '')
+    return f"u{user_id}_session_{safe_phone}"
+
+
+def find_account_owner(session_name):
+    """Ищет владельца сессии среди активных. None если нет."""
+    session = active_sessions.get(session_name)
+    if session is not None:
+        return getattr(session, 'owner_id', None)
+    return None
+
+
+def migrate_legacy_data():
+    """Одноразовая миграция: переносит legacy-файлы в каталог MAIN_ADMIN_ID."""
+    user_dir = user_data_dir(MAIN_ADMIN_ID)
+
+    legacy_pairs = [
+        (LEGACY_ACCOUNTS_FILE, user_dir / ACCOUNTS_FILENAME),
+        (LEGACY_SCENARIOS_FILE, user_dir / SCENARIOS_FILENAME),
+        (LEGACY_CONFIG_FILE, user_dir / CONFIG_FILENAME),
+    ]
+
+    for src, dst in legacy_pairs:
+        try:
+            if os.path.exists(src) and not dst.exists():
+                shutil.move(src, str(dst))
+                print(f"📦 Перенесено: {src} -> {dst}")
+        except Exception as e:
+            print(f"⚠️ Не удалось перенести {src}: {e}")
+
+    # Старые telethon-сессии в корне (session_<phone>.session*) — переносим
+    sessions_dst = user_dir / SESSIONS_DIRNAME
+    sessions_dst.mkdir(exist_ok=True)
+    try:
+        for f in Path('.').glob('session_*.session*'):
+            target = sessions_dst / f.name
+            if not target.exists():
+                shutil.move(str(f), str(target))
+                print(f"📦 Перенесена сессия: {f.name}")
+    except Exception as e:
+        print(f"⚠️ Ошибка переноса telethon-сессий: {e}")
+
+    # Если в legacy-accounts были аккаунты со старым session_name — оставляем
+    # session_name как есть (файл уже лежит в sessions_dst и достижим по пути).
+
+
 # ==================== ФУНКЦИИ ПОЛЬЗОВАТЕЛЕЙ ====================
 
 def load_users():
-    """Загружает список разрешенных пользователей"""
+    """Загружает список разрешенных пользователей."""
     global allowed_users
     if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            allowed_users = data.get('users', [MAIN_ADMIN_ID])
+        try:
+            with open(USERS_FILE, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+            allowed_users = list(data.get('users') or [])
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать {USERS_FILE}: {e}. Сбрасываю список.")
+            allowed_users = []
     else:
-        allowed_users = [MAIN_ADMIN_ID]
+        allowed_users = []
+
+    # Главный админ всегда в списке.
+    if MAIN_ADMIN_ID and MAIN_ADMIN_ID not in allowed_users:
+        allowed_users.append(MAIN_ADMIN_ID)
+        save_users()
+    elif not os.path.exists(USERS_FILE):
         save_users()
     return allowed_users
 
@@ -69,56 +454,60 @@ def is_allowed(user_id):
 # ==================== АВТОПРОВЕРКА СЕССИЙ ====================
 
 async def check_sessions_task():
-    """Фоновая задача проверки сессий каждый час"""
+    """Фоновая задача проверки сессий каждый час (для каждого пользователя отдельно)."""
     while True:
         await asyncio.sleep(3600)  # 1 час
-        
+
         print(f"\n🔍 [{datetime.now().strftime('%H:%M:%S')}] Автопроверка сессий...")
-        
-        accounts = load_accounts()
-        inactive_accounts = []
-        
-        for acc in accounts:
-            session_name = acc['session_name']
-            
-            # Проверяем, активна ли сессия
-            if session_name not in active_sessions:
-                inactive_accounts.append(acc['phone'])
-                continue
-            
-            # Проверяем подключение
-            session = active_sessions[session_name]
-            try:
-                if not session.client.is_connected():
+
+        for owner_id in list(allowed_users):
+            accounts = load_accounts(owner_id)
+            inactive_accounts = []
+
+            for acc in accounts:
+                session_name = acc['session_name']
+
+                # Проверяем, активна ли сессия
+                if session_name not in active_sessions:
                     inactive_accounts.append(acc['phone'])
-                    print(f"⚠️ Сессия {acc['phone']} не подключена")
-            except Exception as e:
-                inactive_accounts.append(acc['phone'])
-                print(f"⚠️ Ошибка проверки {acc['phone']}: {e}")
-        
-        # Отправляем уведомление если есть неактивные
-        if inactive_accounts:
-            notification = (
-                f"⚠️ <b>НЕАКТИВНЫЕ СЕССИИ ОБНАРУЖЕНЫ!</b>\n\n"
-                f"Время проверки: {datetime.now().strftime('%H:%M:%S')}\n"
-                f"Неактивных: {len(inactive_accounts)}\n\n"
-                f"📱 Аккаунты:\n" + 
-                "\n".join([f"• {phone}" for phone in inactive_accounts])
-            )
-            await send_admin_notification(notification)
-            print(f"📨 Отправлено уведомление о {len(inactive_accounts)} неактивных сессиях")
-        else:
-            print(f"✅ Все сессии активны ({len(accounts)} шт)")
+                    continue
+
+                # Проверяем подключение
+                session = active_sessions[session_name]
+                try:
+                    if not session.client.is_connected():
+                        inactive_accounts.append(acc['phone'])
+                        print(f"⚠️ [u{owner_id}] Сессия {acc['phone']} не подключена")
+                except Exception as e:
+                    inactive_accounts.append(acc['phone'])
+                    print(f"⚠️ [u{owner_id}] Ошибка проверки {acc['phone']}: {e}")
+
+            # Отправляем уведомление владельцу
+            if inactive_accounts:
+                notification = (
+                    f"⚠️ <b>НЕАКТИВНЫЕ СЕССИИ ОБНАРУЖЕНЫ!</b>\n\n"
+                    f"Время проверки: {datetime.now().strftime('%H:%M:%S')}\n"
+                    f"Неактивных: {len(inactive_accounts)}\n\n"
+                    f"📱 Аккаунты:\n" +
+                    "\n".join([f"• {phone}" for phone in inactive_accounts])
+                )
+                await send_admin_notification(notification, owner_id=owner_id)
+                print(f"📨 [u{owner_id}] Уведомление о {len(inactive_accounts)} неактивных сессиях")
+            elif accounts:
+                print(f"✅ [u{owner_id}] Все сессии активны ({len(accounts)} шт)")
 
 # ==================== USERBOT КЛАСС ====================
 
 class UserbotSession:
-    def __init__(self, api_id, api_hash, phone, session_name):
+    def __init__(self, api_id, api_hash, phone, session_name, owner_id):
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone = phone
         self.session_name = session_name
-        self.client = TelegramClient(session_name, api_id, api_hash)
+        self.owner_id = owner_id
+        # Файл telethon-сессии хранится в каталоге владельца
+        session_path = user_session_path(owner_id, session_name)
+        self.client = TelegramClient(session_path, api_id, api_hash)
         self.active_dialogs = 0
         self.completed_dialogs = 0
         self.failed_dialogs = 0
@@ -146,7 +535,8 @@ class UserbotSession:
                 reply_cache[reply_id] = {
                     'session_name': self.session_name,
                     'sender_id': sender_id,
-                    'username': username
+                    'username': username,
+                    'owner_id': self.owner_id,
                 }
                 
                 keyboard = [
@@ -160,7 +550,12 @@ class UserbotSession:
                     f"💭 Сообщение:\n{message_text}"
                 )
                 
-                await send_admin_notification(notification, InlineKeyboardMarkup(keyboard))
+                # Уведомление получает только владелец аккаунта
+                await send_admin_notification(
+                    notification,
+                    InlineKeyboardMarkup(keyboard),
+                    owner_id=self.owner_id,
+                )
                 
                 print(f"📨 [{self.phone}] Получено сообщение от {username}")
                 
@@ -397,57 +792,74 @@ class UserbotSession:
 
 # ==================== ФУНКЦИИ ДАННЫХ ====================
 
-def load_accounts():
-    if os.path.exists(ACCOUNTS_FILE):
-        with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+def load_accounts(user_id):
+    """Загружает аккаунты пользователя."""
+    path = user_accounts_path(user_id)
+    if path.exists():
+        with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     return []
 
-def save_accounts(accounts):
-    with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+def save_accounts(user_id, accounts):
+    """Сохраняет аккаунты пользователя."""
+    with open(user_accounts_path(user_id), 'w', encoding='utf-8') as f:
         json.dump(accounts, f, ensure_ascii=False, indent=2)
 
-def load_scenarios():
-    if os.path.exists(SCENARIOS_FILE):
-        with open(SCENARIOS_FILE, 'r', encoding='utf-8') as f:
+def load_scenarios(user_id):
+    """Загружает сценарии пользователя."""
+    path = user_scenarios_path(user_id)
+    if path.exists():
+        with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     return []
 
-def save_scenarios(scenarios):
-    with open(SCENARIOS_FILE, 'w', encoding='utf-8') as f:
+def save_scenarios(user_id, scenarios):
+    """Сохраняет сценарии пользователя."""
+    with open(user_scenarios_path(user_id), 'w', encoding='utf-8') as f:
         json.dump(scenarios, f, ensure_ascii=False, indent=2)
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+def load_config(user_id):
+    """Загружает настройки пользователя."""
+    path = user_config_path(user_id)
+    if path.exists():
+        with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {'delay': 30}
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+def save_config(user_id, config):
+    """Сохраняет настройки пользователя."""
+    with open(user_config_path(user_id), 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-async def send_admin_notification(text, reply_markup=None):
-    """Отправляет уведомление всем админам"""
-    global admin_bot_app
-    if admin_bot_app:
-        try:
-            for user_id in allowed_users:
-                await admin_bot_app.bot.send_message(
-                    chat_id=user_id,
-                    text=text,
-                    parse_mode='HTML',
-                    reply_markup=reply_markup
-                )
-        except Exception as e:
-            print(f"Ошибка отправки уведомления: {e}")
+async def send_admin_notification(text, reply_markup=None, owner_id=None):
+    """Отправляет уведомление.
 
-async def load_session(session_data):
+    Если задан owner_id — только владельцу. Иначе главному админу.
+    Это важно: уведомления о входящих сообщениях аккаунта должны
+    приходить только владельцу аккаунта.
+    """
+    global admin_bot_app
+    if not admin_bot_app:
+        return
+
+    target_user_id = owner_id if owner_id is not None else MAIN_ADMIN_ID
+    try:
+        await admin_bot_app.bot.send_message(
+            chat_id=target_user_id,
+            text=text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        print(f"Ошибка отправки уведомления: {e}")
+
+async def load_session(session_data, owner_id):
     session = UserbotSession(
         session_data['api_id'],
         session_data['api_hash'],
         session_data['phone'],
-        session_data['session_name']
+        session_data['session_name'],
+        owner_id,
     )
     await session.start()
     active_sessions[session_data['session_name']] = session
@@ -462,7 +874,7 @@ async def send_bulk(session, usernames, scenario, delay=None):
     await session.check_spam_status()
     
     if delay is None:
-        config = load_config()
+        config = load_config(session.owner_id)
         delay = config.get('delay', 30)
     
     success = 0
@@ -504,7 +916,9 @@ async def send_bulk_all_accounts(sessions, usernames, scenario, delay=None):
     global global_mailing_stop
     
     if delay is None:
-        config = load_config()
+        # Все сессии в этом списке принадлежат одному пользователю
+        owner_id = sessions[0].owner_id if sessions else MAIN_ADMIN_ID
+        config = load_config(owner_id)
         delay = config.get('delay', 30)
     
     users_per_account = len(usernames) // len(sessions)
@@ -675,10 +1089,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_allowed(user_id):
         await update.message.reply_text(
-            "❌ <b>Доступ запрещен</b>\n\n"
-            "У вас нет доступа к этому боту.",
+            f"❌ <b>Доступ запрещен</b>\n\n"
+            f"У вас нет доступа к этому боту.\n\n"
+            f"Ваш ID: <code>{user_id}</code>\n"
+            f"MAIN_ADMIN_ID: <code>{MAIN_ADMIN_ID}</code>\n\n"
+            f"Если это ваш бот — поправьте MAIN_ADMIN_ID в secrets.json/.env, "
+            f"или добавьте свой ID в users.json.",
             parse_mode='HTML'
         )
+        print(f"[start] Отказ в доступе: user_id={user_id}, MAIN_ADMIN_ID={MAIN_ADMIN_ID}, allowed={allowed_users}")
         return
     
     role = "Главный админ" if user_id == MAIN_ADMIN_ID else "Пользователь"
@@ -775,7 +1194,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu_keyboard(user_id)
             )
             return
-        
+
+        # Отвечать может только владелец аккаунта
+        if reply_cache[reply_id].get('owner_id') != user_id:
+            await query.answer("❌ Чужой аккаунт", show_alert=True)
+            return
+
         user_states[user_id] = {
             'action': 'send_reply',
             'reply_id': reply_id
@@ -800,7 +1224,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif data == "menu_accounts":
-        accounts = load_accounts()
+        accounts = load_accounts(user_id)
         active_count = len([a for a in accounts if a['session_name'] in active_sessions])
         
         await query.edit_message_text(
@@ -813,14 +1237,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == "stop_all_mailing":
         global_mailing_stop = True
-        
-        for session_name in active_sessions.keys():
-            mailing_paused[session_name] = True
-        
+
+        # Останавливаем только свои сессии
+        own_accounts = load_accounts(user_id)
+        for acc in own_accounts:
+            if acc['session_name'] in active_sessions:
+                mailing_paused[acc['session_name']] = True
+
         await query.edit_message_text(
             "⛔ <b>ВСЕ РАССЫЛКИ ОСТАНОВЛЕНЫ!</b>\n\n"
             "Чтобы возобновить, снимите паузу с нужных аккаунтов.",
-            reply_markup=accounts_keyboard(load_accounts()),
+            reply_markup=accounts_keyboard(own_accounts),
             parse_mode='HTML'
         )
     
@@ -834,7 +1261,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("acc_"):
         acc_id = int(data.split("_")[1])
-        accounts = load_accounts()
+        accounts = load_accounts(user_id)
         acc = accounts[acc_id]
         
         is_active = acc['session_name'] in active_sessions
@@ -854,7 +1281,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("pause_acc_"):
         acc_id = int(data.split("_")[2])
-        accounts = load_accounts()
+        accounts = load_accounts(user_id)
         acc = accounts[acc_id]
         session_name = acc['session_name']
         
@@ -874,9 +1301,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("delete_acc_"):
         acc_id = int(data.split("_")[2])
-        accounts = load_accounts()
+        accounts = load_accounts(user_id)
         deleted = accounts.pop(acc_id)
-        save_accounts(accounts)
+        save_accounts(user_id, accounts)
         
         if deleted['session_name'] in active_sessions:
             await active_sessions[deleted['session_name']].disconnect()
@@ -888,7 +1315,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif data == "menu_scenarios":
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         await query.edit_message_text(
             f"📋 <b>Сценарии рассылки</b>\n\n"
             f"Всего сценариев: {len(scenarios)}",
@@ -906,7 +1333,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("scenario_") and "view_scenario" not in data and "delete_scenario" not in data:
         scenario_id = int(data.split("_")[1])
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenario = scenarios[scenario_id]
         
         steps_text = "\n".join([
@@ -934,9 +1361,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("step_greeting_"):
         scenario_id = int(data.split("_")[2])
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenarios[scenario_id]['steps'].append({'type': 'greeting'})
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await query.edit_message_text(
             "✅ Шаг 'Приветствие' добавлен",
@@ -996,7 +1423,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("view_scenario_"):
         scenario_id = int(data.split("_")[2])
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenario = scenarios[scenario_id]
         
         steps_detail = ""
@@ -1026,9 +1453,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("delete_scenario_"):
         scenario_id = int(data.split("_")[2])
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         deleted = scenarios.pop(scenario_id)
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await query.edit_message_text(
             f"✅ Сценарий '{deleted['name']}' удален",
@@ -1036,7 +1463,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif data == "menu_stats":
-        accounts = load_accounts()
+        accounts = load_accounts(user_id)
         total_active = 0
         total_completed = 0
         total_failed = 0
@@ -1072,7 +1499,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu_settings":
-        config = load_config()
+        config = load_config(user_id)
         delay = config.get('delay', 30)
         
         keyboard = [
@@ -1100,7 +1527,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif data == "menu_mailing":
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         
         if not scenarios:
             await query.edit_message_text(
@@ -1128,7 +1555,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = user_states[user_id]
         state['scenario_id'] = scenario_id
         
-        accounts = load_accounts()
+        accounts = load_accounts(user_id)
         
         await query.edit_message_text(
             "Шаг 3/3: Выберите аккаунт:",
@@ -1143,9 +1570,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usernames = state['usernames']
         scenario_id = state['scenario_id']
         
-        accounts = load_accounts()
-        scenarios = load_scenarios()
-        config = load_config()
+        accounts = load_accounts(user_id)
+        scenarios = load_scenarios(user_id)
+        config = load_config(user_id)
         
         scenario = scenarios[scenario_id]
         delay = config.get('delay', 30)
@@ -1189,9 +1616,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usernames = state['usernames']
         scenario_id = state['scenario_id']
         
-        accounts = load_accounts()
-        scenarios = load_scenarios()
-        config = load_config()
+        accounts = load_accounts(user_id)
+        scenarios = load_scenarios(user_id)
+        config = load_config(user_id)
         
         account = accounts[acc_id]
         scenario = scenarios[scenario_id]
@@ -1320,23 +1747,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         elif step == 'phone':
             phone = update.message.text
-            session_name = f"session_{phone.replace('+', '').replace(' ', '')}"
-            
+            session_name = make_session_name(user_id, phone)
+
             state['phone'] = phone
             state['session_name'] = session_name
-            
+
             try:
                 await update.message.reply_text("⏳ Отправка кода...")
-                
-                client = TelegramClient(session_name, state['api_id'], state['api_hash'])
+
+                client = TelegramClient(
+                    user_session_path(user_id, session_name),
+                    state['api_id'],
+                    state['api_hash'],
+                )
                 await client.connect()
-                
+
                 if not await client.is_user_authorized():
                     result = await client.send_code_request(phone)
                     state['phone_code_hash'] = result.phone_code_hash
                     state['client'] = client
                     state['step'] = 'code'
-                    
+
                     await update.message.reply_text(
                         "📱 <b>Код отправлен в Telegram!</b>\n\n"
                         "Проверьте ваш Telegram и отправьте код сюда.\n"
@@ -1345,17 +1776,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 else:
                     me = await client.get_me()
-                    
-                    accounts = load_accounts()
+
+                    accounts = load_accounts(user_id)
                     accounts.append({
                         'api_id': state['api_id'],
                         'api_hash': state['api_hash'],
                         'phone': phone,
                         'session_name': session_name
                     })
-                    save_accounts(accounts)
-                    
-                    temp_session = UserbotSession(state['api_id'], state['api_hash'], phone, session_name)
+                    save_accounts(user_id, accounts)
+
+                    temp_session = UserbotSession(
+                        state['api_id'],
+                        state['api_hash'],
+                        phone,
+                        session_name,
+                        user_id,
+                    )
                     temp_session.client = client
                     await temp_session.setup_message_handler()
                     active_sessions[session_name] = temp_session
@@ -1451,21 +1888,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         raise e
                 
                 me = await client.get_me()
-                
-                accounts = load_accounts()
+
+                accounts = load_accounts(user_id)
                 accounts.append({
                     'api_id': state['api_id'],
                     'api_hash': state['api_hash'],
                     'phone': phone,
                     'session_name': state['session_name']
                 })
-                save_accounts(accounts)
-                
+                save_accounts(user_id, accounts)
+
                 temp_session = UserbotSession(
                     state['api_id'],
                     state['api_hash'],
                     phone,
-                    state['session_name']
+                    state['session_name'],
+                    user_id,
                 )
                 temp_session.client = client
                 await temp_session.setup_message_handler()
@@ -1508,20 +1946,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 me = await client.get_me()
                 
-                accounts = load_accounts()
+                accounts = load_accounts(user_id)
                 accounts.append({
                     'api_id': state['api_id'],
                     'api_hash': state['api_hash'],
                     'phone': state['phone'],
                     'session_name': state['session_name']
                 })
-                save_accounts(accounts)
-                
+                save_accounts(user_id, accounts)
+
                 temp_session = UserbotSession(
                     state['api_id'],
                     state['api_hash'],
                     state['phone'],
-                    state['session_name']
+                    state['session_name'],
+                    user_id,
                 )
                 temp_session.client = client
                 await temp_session.setup_message_handler()
@@ -1550,9 +1989,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 del user_states[user_id]
     
     elif action == 'create_scenario':
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenarios.append({'name': update.message.text, 'steps': []})
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await update.message.reply_text(
             f"✅ Сценарий '{update.message.text}' создан!",
@@ -1561,12 +2000,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del user_states[user_id]
     
     elif action == 'add_step_text':
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenarios[state['scenario_id']]['steps'].append({
             'type': 'text',
             'content': update.message.text
         })
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await update.message.reply_text(
             "✅ Текст добавлен",
@@ -1582,13 +2021,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state['step'] = 'command'
             await update.message.reply_text("Шаг 2/2: Команда для бота (обычно /pyid):")
         elif step == 'command':
-            scenarios = load_scenarios()
+            scenarios = load_scenarios(user_id)
             scenarios[state['scenario_id']]['steps'].append({
                 'type': 'forward_from_bot',
                 'bot_username': state['bot_username'],
                 'command': update.message.text
             })
-            save_scenarios(scenarios)
+            save_scenarios(user_id, scenarios)
             
             await update.message.reply_text(
                 "✅ Пересылка добавлена",
@@ -1597,12 +2036,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_states[user_id]
     
     elif action == 'add_step_channel':
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenarios[state['scenario_id']]['steps'].append({
             'type': 'forward_from_channel',
             'post_link': update.message.text
         })
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await update.message.reply_text(
             "✅ Пересылка поста добавлена",
@@ -1622,14 +2061,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state['step'] = 'index'
             await update.message.reply_text("Шаг 3/3: Номер результата (0, 1, 2...):")
         elif step == 'index':
-            scenarios = load_scenarios()
+            scenarios = load_scenarios(user_id)
             scenarios[state['scenario_id']]['steps'].append({
                 'type': 'inline',
                 'bot_username': state['bot_username'],
                 'query': state['query'],
                 'result_index': int(update.message.text)
             })
-            save_scenarios(scenarios)
+            save_scenarios(user_id, scenarios)
             
             await update.message.reply_text(
                 "✅ Инлайн добавлен",
@@ -1638,12 +2077,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_states[user_id]
     
     elif action == 'add_step_delay':
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenarios[state['scenario_id']]['steps'].append({
             'type': 'delay',
             'seconds': int(update.message.text)
         })
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await update.message.reply_text(
             "✅ Задержка добавлена",
@@ -1655,7 +2094,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usernames = [line.strip().lstrip('@') for line in update.message.text.split('\n') if line.strip()]
         state['usernames'] = usernames
         
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         keyboard = []
         for i, sc in enumerate(scenarios):
             keyboard.append([InlineKeyboardButton(
@@ -1688,9 +2127,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            config = load_config()
+            config = load_config(user_id)
             config['delay'] = delay
-            save_config(config)
+            save_config(user_id, config)
             
             keyboard = [
                 [InlineKeyboardButton("⏱️ Изменить", callback_data="change_delay")],
@@ -1721,12 +2160,12 @@ async def sticker_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_states[user_id]
     
     if state.get('action') == 'add_step_sticker':
-        scenarios = load_scenarios()
+        scenarios = load_scenarios(user_id)
         scenarios[state['scenario_id']]['steps'].append({
             'type': 'sticker',
             'file_id': update.message.sticker.file_id
         })
-        save_scenarios(scenarios)
+        save_scenarios(user_id, scenarios)
         
         await update.message.reply_text(
             "✅ Стикер добавлен",
@@ -1779,21 +2218,46 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     import traceback
     traceback.print_exc()
 
+async def restore_sessions():
+    """При старте поднимает telethon-сессии для всех пользователей."""
+    for owner_id in list(allowed_users):
+        accounts = load_accounts(owner_id)
+        for acc in accounts:
+            try:
+                await load_session(acc, owner_id)
+                print(f"✅ [u{owner_id}] Сессия {acc['phone']} восстановлена")
+            except Exception as e:
+                print(f"⚠️ [u{owner_id}] Не удалось восстановить {acc.get('phone')}: {e}")
+
+
 def main():
     global admin_bot_app
-    
+
     print("🚀 Запуск панели управления...")
-    
+
+    if not ADMIN_BOT_TOKEN or MAIN_ADMIN_ID == 0:
+        script_dir = Path(__file__).resolve().parent
+        print("❌ Не задан ADMIN_BOT_TOKEN и/или MAIN_ADMIN_ID.")
+        print("   Создайте файл secrets.json рядом со скриптом:")
+        print(f"   {script_dir / 'secrets.json'}")
+        print('   {"ADMIN_BOT_TOKEN": "<токен_от_BotFather>", "MAIN_ADMIN_ID": 123456789}')
+        print("   Либо задайте переменные окружения ADMIN_BOT_TOKEN и MAIN_ADMIN_ID.")
+        return
+
     # Загружаем пользователей
     load_users()
     print(f"👥 Разрешенных пользователей: {len(allowed_users)}")
-    
+
+    # Готовим директории и переносим legacy-файлы (если остались)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    migrate_legacy_data()
+
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    
+
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
         connection_pool_size=8,
@@ -1802,32 +2266,46 @@ def main():
         write_timeout=30.0,
         pool_timeout=30.0
     )
-    
+
     application = (
         Application.builder()
         .token(ADMIN_BOT_TOKEN)
         .request(request)
         .build()
     )
-    
+
     admin_bot_app = application
-    
+
+    # Перехватываем bot.send_message / bot.edit_message_text:
+    # автоматически заменяем эмодзи на premium custom emoji (HTML-теги).
+    install_premium_emoji_filter(application)
+
+    # Иконки premium-эмодзи у inline-кнопок (icon_custom_emoji_id).
+    # Требует PTB >= 22.7 и Telegram Premium у владельца бота.
+    install_premium_button_filter()
+
     application.add_error_handler(error_handler)
-    
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     application.add_handler(MessageHandler(filters.Sticker.ALL, sticker_handler))
-    
-    # Запускаем фоновую задачу проверки сессий
-    asyncio.create_task(check_sessions_task())
-    
+
+    async def _post_init(app):
+        # Восстанавливаем активные сессии для каждого пользователя
+        await restore_sessions()
+        # Запускаем фоновую задачу проверки сессий (требует loop)
+        asyncio.create_task(check_sessions_task())
+
+    application.post_init = _post_init
+
     print("✅ Панель готова! Откройте бота в Telegram")
-    print("📬 Уведомления о входящих сообщениях включены")
+    print("📬 Уведомления о входящих сообщениях включены (приходят только владельцу аккаунта)")
     print("🚀 Поддержка массовой рассылки на все аккаунты!")
     print("🔍 Автопроверка сессий каждый час!")
+    print("✨ Premium custom emoji включены")
     print(f"👑 Главный админ: {MAIN_ADMIN_ID}")
-    
+
     try:
         application.run_polling(close_loop=False)
     except KeyboardInterrupt:
